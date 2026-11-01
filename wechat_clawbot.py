@@ -48,6 +48,10 @@ class ClawbotError(Exception):
     """iLink 协议错误。"""
 
 
+class SessionExpiredError(ClawbotError):
+    """会话过期（errcode -14），需重新扫码登录。"""
+
+
 # --------------------------------------------------------------------------- #
 # 数据结构
 # --------------------------------------------------------------------------- #
@@ -147,25 +151,36 @@ class WeChatClawBot:
     @classmethod
     def login_with_qr(cls, cred_file: str = "ilink_cred.json",
                       on_qr: Optional[Callable[[str, str], None]] = None,
-                      timeout: int = 300) -> "WeChatClawBot":
+                      timeout: int = 300,
+                      qr_ttl: int = 80) -> "WeChatClawBot":
         """
         扫码登录。on_qr(qrcode, qr_url) 回调让你展示二维码（打印/生成图片都行）。
-        阻塞直到用户扫码确认。
+        二维码约 90 秒过期，到期自动申请新码并再次回调 on_qr，无需重启。
+        阻塞直到用户扫码确认或超过 timeout。
         """
-        # 1. 申请二维码
-        r = cls._static_get(f"{DEFAULT_BASE}/ilink/bot/get_bot_qrcode?bot_type=3")
-        qrcode = r["qrcode"]
-        qr_url = r.get("qrcode_img_content", "")
-        if on_qr:
-            on_qr(qrcode, qr_url)
-        else:
-            print(f"请用手机微信扫码登录：{qr_url}")
-
-        # 2. 轮询扫码状态
         deadline = time.time() + timeout
+        qrcode = qr_url = ""
+
+        def fetch_qr():
+            nonlocal qrcode, qr_url
+            r = cls._static_get(f"{DEFAULT_BASE}/ilink/bot/get_bot_qrcode?bot_type=3")
+            qrcode, qr_url = r["qrcode"], r.get("qrcode_img_content", "")
+            if on_qr:
+                on_qr(qrcode, qr_url)
+            else:
+                print(f"请用手机微信扫码登录：{qr_url}")
+
+        fetch_qr()
+        last_refresh = time.time()
+
         while time.time() < deadline:
+            # 二维码快过期，自动换一张新码
+            if time.time() - last_refresh >= qr_ttl:
+                fetch_qr()
+                last_refresh = time.time()
             s = cls._static_get(f"{DEFAULT_BASE}/ilink/bot/get_qrcode_status?qrcode={qrcode}")
-            if s.get("status") == "confirmed":
+            status = s.get("status")
+            if status == "confirmed":
                 bot = cls(
                     bot_token=s["bot_token"],
                     chat_user_id=s.get("ilink_user_id", ""),
@@ -175,6 +190,9 @@ class WeChatClawBot:
                 )
                 bot.save()
                 return bot
+            if status == "expired":
+                fetch_qr()  # 立即换新码
+                last_refresh = time.time()
             time.sleep(2)
         raise ClawbotError("扫码超时")
 
@@ -192,7 +210,7 @@ class WeChatClawBot:
             "get_updates_buf": self._cursor,
         }, timeout=60)
         if r.get("errcode") == -14:
-            raise ClawbotError("会话过期，需重新扫码登录")
+            raise SessionExpiredError("会话过期，需重新扫码登录")
         self._cursor = r.get("get_updates_buf", self._cursor)
         out = []
         for m in r.get("msgs") or []:
@@ -250,7 +268,10 @@ class WeChatClawBot:
                 "item_list": item_list,
             },
         }
-        return self._post("/ilink/bot/sendmessage", body, timeout=15)
+        r = self._post("/ilink/bot/sendmessage", body, timeout=15)
+        if r.get("errcode") == -14:
+            raise SessionExpiredError("会话过期，需重新扫码登录")
+        return r
 
     def send_text(self, to_user_id: str, text: str,
                   context_token: str = "") -> Dict[str, Any]:
